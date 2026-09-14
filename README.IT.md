@@ -147,6 +147,57 @@ dd if=/dev/urandom bs=1M count=100 \
   chiusa e ristabilita su entrambi i lati; il mittente ripete `HELLO` sulla
   nuova connessione.
 
+## Cifratura dello stream con OpenSSL
+
+`multisend` tratta input/output come byte opachi, quindi il modo più semplice
+per mantenere confidenziale un trasferimento è convogliare i dati attraverso
+`openssl enc` — prima che entrino nel mittente e di nuovo dopo che escono dal
+ricevitore — usando una passphrase condivisa fissa:
+
+```sh
+# Macchina A (mittente)
+zfs send pool/dataset \
+  | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -k 'la tua passphrase condivisa' \
+  | multisend --sender --listen :9000 --streams 4
+
+# Macchina B (ricevitore)
+multisend --receiver --connect macchinaA:9000 --streams 4 \
+  | openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -k 'la tua passphrase condivisa' \
+  | zfs recv pool/dataset
+```
+
+Note:
+
+- Usa la **stessa passphrase, algoritmo e valore di `-iter`** su entrambi i
+  lati. `-pbkdf2` (OpenSSL 1.1.1+) deriva la chiave con un KDF salato invece
+  del legacy `EVP_BytesToKey`, e richiede lo stesso flag in decrittazione.
+- Il salt viene generato di nuovo a ogni esecuzione e incorporato
+  nell'intestazione dell'output: input identico produce comunque cifratura
+  diversa, e la decrittazione non richiede coordinamento aggiuntivo.
+- La passphrase non viene mai trasmessa da `multisend`: la cifratura avviene
+  sul flusso di byte *prima* del multiplexing, quindi sulle connessioni TCP
+  viaggia solo il ciphertext. La numerazione interna dei chunk non rivela il
+  plaintext.
+- Esempio di verifica locale:
+
+  ```sh
+  dd if=/dev/urandom bs=1M count=100 \
+    | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -k 'secret' \
+    | multisend --sender --listen :9000 \
+    | multisend --receiver --connect 127.0.0.1:9000 \
+    | openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -k 'secret' \
+    | md5sum
+  ```
+
+- Note di sicurezza: con una passphrase condivisa fissa, la sicurezza dipende
+  dalla robustezza della passphrase e dal costo del KDF — aumenta `-iter`
+  (default 10000, es. `100000` o più a seconda della macchina) di
+  conseguenza. Una passphrase passata con `-k` è visibile nella lista dei
+  processi (`ps`); dove conta, preferisci `-pass env:PASS` (da una variabile
+  d'ambiente) o `-pass file:<percorso>`, così la passphrase non fa parte della
+  riga di comando. Sul filo non c'è plaintext, ma questo non autentica le
+  parti: protegge solo la confidenzialità.
+
 ## Nota sui test automatici
 
 Il ricevitore supporta l'hook di test `MULTISEND_TEST_DROP_SEQS` (numeri di

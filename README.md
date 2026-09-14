@@ -142,6 +142,55 @@ dd if=/dev/urandom bs=1M count=100 \
   re-established on both sides; the sender repeats `HELLO` on the new
   connection.
 
+## Encrypting the stream with OpenSSL
+
+`multisend` treats its input/output as opaque bytes, so the simplest way to
+keep a transfer confidential end-to-end is to pipe the data through
+`openssl enc` — before it enters the sender and again after it leaves the
+receiver — using a fixed shared passphrase:
+
+```sh
+# Machine A (sender)
+zfs send pool/dataset \
+  | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -k 'your shared passphrase' \
+  | multisend --sender --listen :9000 --streams 4
+
+# Machine B (receiver)
+multisend --receiver --connect machineA:9000 --streams 4 \
+  | openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -k 'your shared passphrase' \
+  | zfs recv pool/dataset
+```
+
+Notes:
+
+- Use the **same algorithm, passphrase and `-iter` value** on both sides.
+  `-pbkdf2` (OpenSSL 1.1.1+) derives the key with a salted KDF instead of the
+  legacy `EVP_BytesToKey`, and requires the same flag when decrypting.
+- The salt is generated fresh on every encryption run and embedded in the
+  output header, so identical input still produces different ciphertext, and
+  decryption needs no extra coordination.
+- The passphrase is never transmitted by `multisend`: encryption happens on the
+  byte stream *before* multiplexing, so only ciphertext travels over the TCP
+  streams. The internal chunk numbering does not leak the plaintext.
+- Local verification example:
+
+  ```sh
+  dd if=/dev/urandom bs=1M count=100 \
+    | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -k 'secret' \
+    | multisend --sender --listen :9000 \
+    | multisend --receiver --connect 127.0.0.1:9000 \
+    | openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -k 'secret' \
+    | md5sum
+  ```
+
+- Security notes: with a fixed shared passphrase, security depends on the
+  passphrase strength and the KDF cost — raise `-iter` (default 10000, e.g.
+  `100000` or higher) on slow machines accordingly. A passphrase passed as
+  `-k` is visible in the process list (`ps`); prefer `-pass env:PASS` (from an
+  env var) or `-pass file:<path>` where that matters, so the passphrase is not
+  part of the command line. There is no plaintext on the wire, but this does
+  not authenticate the endpoints: it protects confidentiality only.
+
 ## Automated testing note
 
 The receiver supports the `MULTISEND_TEST_DROP_SEQS` test hook (comma-separated
