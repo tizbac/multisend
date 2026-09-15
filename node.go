@@ -28,6 +28,7 @@ type Node struct {
 	resendTmo  time.Duration
 	progress   bool
 	queueMode  string
+	lifetime   time.Duration // 0 = keep connections forever (client side only)
 	start      time.Time
 
 	conns     []*Conn
@@ -39,7 +40,7 @@ type Node struct {
 }
 
 func NewNode(host string, basePort int, listenMode, singlePort bool, numStreams, chunkSize int,
-	connTmo, resendTmo time.Duration, progress bool, queueMode string) *Node {
+	connTmo, resendTmo time.Duration, progress bool, queueMode string, lifetime time.Duration) *Node {
 	n := &Node{
 		host:       host,
 		basePort:   basePort,
@@ -51,6 +52,7 @@ func NewNode(host string, basePort int, listenMode, singlePort bool, numStreams,
 		resendTmo:  resendTmo,
 		progress:   progress,
 		queueMode:  queueMode,
+		lifetime:   lifetime,
 		start:      time.Now(),
 		done:       make(chan struct{}),
 	}
@@ -108,6 +110,9 @@ func (n *Node) Run() error {
 	go n.in.writeLoop()
 	go n.in.resendLoop()
 	go n.out.Run()
+	if n.lifetime > 0 && !n.listenMode {
+		go n.rotateLoop()
+	}
 
 	// Stay up until BOTH directions have finished: the local stdin is fully
 	// transmitted and acknowledged, and the peer has finished transmitting
@@ -245,6 +250,32 @@ func (n *Node) redial(slot int) {
 		case <-n.done:
 			return
 		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// rotateLoop implements the client-side --conn-lifetime feature. Every
+// lifetime period it force-closes every stream socket regardless of whether
+// the connection is alive; each stream's reader goroutine then observes the
+// break through the normal error path and re-establishes the stream.
+func (n *Node) rotateLoop() {
+	ticker := time.NewTicker(n.lifetime)
+	defer ticker.Stop()
+	rot := uint64(0)
+	for {
+		select {
+		case <-n.done:
+			return
+		case <-ticker.C:
+			if n.closed() {
+				return
+			}
+			rot++
+			n.prog.Log("%s%s rotation %d: closing and re-establishing %d stream(s)%s",
+				Cyan, Bold, rot, n.numStreams, Reset)
+			for i := range n.conns {
+				n.conns[i].forceClose()
+			}
 		}
 	}
 }

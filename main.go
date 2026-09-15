@@ -23,6 +23,8 @@ func main() {
 	progressEnabled := flag.Bool("progress", true, "Show live progress box on stderr (set false to disable)")
 	queueMode := flag.String("queue-mode", "round-robin",
 		"Chunk queueing mode: round-robin (default) or least-unacked (send the next chunk to the stream with the fewest unacked chunks)")
+	connLifetime := flag.Duration("conn-lifetime", 0,
+		"Client-side connection lifetime; after this time all streams are killed and re-established even if still alive (0 = keep connections forever)")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 
 	flag.Usage = func() {
@@ -68,6 +70,9 @@ func main() {
   --resend-timeout D  Timeout before requesting resend (default: 3s)
    --conn-timeout D    Idle timeout per connection; 0 to disable (default: 30s)
    --queue-mode M      Chunk queueing mode: round-robin or least-unacked
+   --conn-lifetime D   Client-side connection lifetime; after it elapses all
+                       streams are killed and rebuilt even if still alive
+                       (default: 0, keep forever)
    --progress          Show live progress box on stderr (default: true)
    --version           Show version
 `, Bold+"multisend"+Reset,
@@ -105,7 +110,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "%s%sError: invalid listen address: %v%s\n", Red, Bold, err, Reset)
 			os.Exit(1)
 		}
-		n := NewNode(host, port, true, *singlePort, *numStreams, *chunkSize, *connTimeout, *resendTimeout, *progressEnabled, *queueMode)
+		n := NewNode(host, port, true, *singlePort, *numStreams, *chunkSize, *connTimeout, *resendTimeout, *progressEnabled, *queueMode, *connLifetime)
 		if err := n.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "%s%sError: %v%s\n", Red, Bold, err, Reset)
 			os.Exit(1)
@@ -116,7 +121,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "%s%sError: invalid connect address: %v%s\n", Red, Bold, err, Reset)
 			os.Exit(1)
 		}
-		n := NewNode(host, port, false, *singlePort, *numStreams, *chunkSize, *connTimeout, *resendTimeout, *progressEnabled, *queueMode)
+		n := NewNode(host, port, false, *singlePort, *numStreams, *chunkSize, *connTimeout, *resendTimeout, *progressEnabled, *queueMode, *connLifetime)
 		if err := n.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "%s%sError: %v%s\n", Red, Bold, err, Reset)
 			os.Exit(1)

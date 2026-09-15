@@ -67,9 +67,11 @@ go install .
 
 ```
 multisend --listen ADDR [--streams N] [--chunk-size N] \
-          [--resend-timeout D] [--conn-timeout D] [--single-port bool] [--queue-mode M] [--progress]
+          [--resend-timeout D] [--conn-timeout D] [--single-port bool] \
+          [--queue-mode M] [--conn-lifetime D] [--progress]
 multisend --connect ADDR [--streams N] [--chunk-size N] \
-          [--resend-timeout D] [--conn-timeout D] [--single-port bool] [--queue-mode M] [--progress]
+          [--resend-timeout D] [--conn-timeout D] [--single-port bool] \
+          [--queue-mode M] [--conn-lifetime D] [--progress]
 ```
 
 Exactly one of `--listen` or `--connect` must be given. `--single-port` defaults to
@@ -110,6 +112,7 @@ multisend --connect 127.0.0.1:9000 --streams 1 </dev/null >/tmp/ms_B.out 2>/tmp/
 | `--chunk-size N` | Chunk size in bytes (default: 65536 = 64 KiB). Advertised to the peer via HELLO |
 | `--resend-timeout D` | Timeout before requesting retransmission of a missing chunk (default: 3s) |
 | `--conn-timeout D` | Idle timeout per connection; a stream with no traffic for this long is deemed dead and re-established (default: 30s, `0` to disable) |
+| `--conn-lifetime D` | Client-side connection lifetime; after this time all streams are killed and re-established even if still alive (default: `0` = keep forever) |
 | `--queue-mode M` | Chunk queueing mode: `round-robin` (default) or `least-unacked` (next chunk goes to the stream with the fewest unacked chunks) |
 | `--progress` | Show live progress box on stderr (default: `true`; `--progress=false` to disable) |
 | `--version` | Show version and exit |
@@ -159,6 +162,9 @@ multisend --connect 127.0.0.1:9000 --streams 1 </dev/null >/tmp/ms_B.out 2>/tmp/
 - If a connection drops or stays idle beyond `--conn-timeout`, it is closed and
   re-established on both sides; the sender repeats `HELLO` on the new
   connection.
+- When `--conn-lifetime` is set (client side only), every stream is forcibly
+  closed and rebuilt at the given interval even if all connections are healthy,
+  for periodic connection rotation.
 
 ## Encrypting the stream with OpenSSL
 

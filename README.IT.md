@@ -69,9 +69,11 @@ go install .
 
 ```
 multisend --listen ADDR [--streams N] [--chunk-size N] \
-          [--resend-timeout D] [--conn-timeout D] [--single-port bool] [--queue-mode M] [--progress]
+          [--resend-timeout D] [--conn-timeout D] [--single-port bool] \
+          [--queue-mode M] [--conn-lifetime D] [--progress]
 multisend --connect ADDR [--streams N] [--chunk-size N] \
-          [--resend-timeout D] [--conn-timeout D] [--single-port bool] [--queue-mode M] [--progress]
+          [--resend-timeout D] [--conn-timeout D] [--single-port bool] \
+          [--queue-mode M] [--conn-lifetime D] [--progress]
 ```
 
 Deve essere indicata esattamente una tra `--listen` e `--connect`.
@@ -113,6 +115,7 @@ multisend --connect 127.0.0.1:9000 --streams 1 </dev/null >/tmp/ms_B.out 2>/tmp/
 | `--chunk-size N` | Dimensione dei chunk in byte (default: 65536 = 64 KiB). Pubblicizzata al peer via HELLO |
 | `--resend-timeout D` | Tempo di attesa prima di richiedere la ritrasmissione di un chunk mancante (default: 3s) |
 | `--conn-timeout D` | Timeout di inattività per connessione; uno stream senza traffico per questo periodo è considerato morto e viene ristabilito (default: 30s, `0` per disabilitare) |
+| `--conn-lifetime D` | Durata massima della connessione lato client; allo scadere di questo valore tutti gli stream vengono chiusi e ricostruiti anche se ancora attivi (default: `0` = mantenerli per sempre) |
 | `--queue-mode M` | Modalità di coda dei chunk: `round-robin` (default) o `least-unacked` (il prossimo chunk va allo stream con meno chunk non ancora confermati) |
 | `--progress` | Mostra l'interfaccia di avanzamento live su stderr (default: `true`; `--progress=false` per disattivarla) |
 | `--version` | Mostra la versione ed esce |
@@ -163,6 +166,10 @@ multisend --connect 127.0.0.1:9000 --streams 1 </dev/null >/tmp/ms_B.out 2>/tmp/
 - Se una connessione cade o resta inattiva oltre `--conn-timeout`, viene
   chiusa e ristabilita su entrambi i lati; il nodo ripete `HELLO` sulla nuova
   connessione.
+- Quando `--conn-lifetime` è impostato (solo lato client), ogni stream viene
+  chiuso con forza e ricostruito all'intervallo stabilito anche se tutte le
+  connessioni sono sane, per eseguire una rotazione periodica delle
+  connessioni.
 
 ## Cifratura dello stream con OpenSSL
 

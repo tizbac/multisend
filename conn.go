@@ -53,6 +53,19 @@ func (c *Conn) closeConn() {
 	c.mu.Unlock()
 }
 
+// forceClose unconditionally closes the current socket (if any) WITHOUT
+// clearing the slot, so the reader goroutine parked in readMsg gets an error,
+// marks the stream down and restores it through the normal path. This is what
+// the --conn-lifetime rotation uses: the streams are killed whether they are
+// alive or not, and rebuilt right after.
+func (c *Conn) forceClose() {
+	c.mu.Lock()
+	if c.nc != nil {
+		c.nc.Close()
+	}
+	c.mu.Unlock()
+}
+
 // closeIfCurrent closes nc only if it is still the stream's active socket (it
 // was not already replaced by a re-establishment). Reports whether it closed.
 func (c *Conn) closeIfCurrent(nc net.Conn) bool {
