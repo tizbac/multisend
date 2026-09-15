@@ -3,8 +3,6 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
-	"io"
-	"net"
 	"os"
 	"strings"
 	"sync"
@@ -12,56 +10,44 @@ import (
 	"time"
 )
 
-type Receiver struct {
-	senderHost string
-	basePort   int
-	numStreams int
-	chunkSize  int64 // learned from sender's Hello, atomic
-	connTmo    time.Duration
-	resendTmo  time.Duration
-
-	conns   []net.Conn
-	writers []*MsgWriter
-	prog    *ProgressDisplay
+// inFlow is the receiving half of a bidirectional node. It reassembles the
+// peer's numbered chunks in sequence order, writes them to stdout, and drives
+// retransmission: missing chunks are detected from gaps, requested on any
+// live stream after resendTmo, and acknowledged as they arrive.
+type inFlow struct {
+	conns     []*Conn
+	resendTmo time.Duration
+	prog      *ProgressDisplay
 
 	receiveMu   sync.Mutex
+	chunkSize   atomic.Int64
 	expectedSeq uint64
 	maxSeen     uint64
 	seen        map[uint64]bool
 	missing     map[uint64]time.Time // seq -> when first detected missing
 	buffer      map[uint64]*Chunk    // out-of-order chunks awaiting their turn
-	totalRecv   uint64
+	recvTotal   atomic.Uint64
+	recvChunks  atomic.Uint64
 	doneCount   int32
-	allDone     chan struct{}
-
-	// test hooks (set via MULTISEND_TEST_DROP_SEQS env, never set in production)
-	dropSeqs map[uint64]bool
+	doneOnce    sync.Once
+	done        chan struct{}
+	dropSeqs    map[uint64]bool
 }
 
-func NewReceiver(senderHost string, basePort, numStreams int, connTmo, resendTmo time.Duration, progress ...bool) *Receiver {
-	enabled := true
-	if len(progress) > 0 {
-		enabled = progress[0]
+func newInFlow(conns []*Conn, resendTmo time.Duration, prog *ProgressDisplay) *inFlow {
+	return &inFlow{
+		conns:     conns,
+		resendTmo: resendTmo,
+		prog:      prog,
+		seen:      make(map[uint64]bool),
+		missing:   make(map[uint64]time.Time),
+		buffer:    make(map[uint64]*Chunk),
+		done:      make(chan struct{}),
+		dropSeqs:  parseDropSeqs(),
 	}
-	r := &Receiver{
-		senderHost: senderHost,
-		basePort:   basePort,
-		numStreams: numStreams,
-		connTmo:    connTmo,
-		resendTmo:  resendTmo,
-		conns:      make([]net.Conn, numStreams),
-		writers:    make([]*MsgWriter, numStreams),
-		prog:       NewProgressDisplay("receiver", numStreams, 0, enabled),
-		seen:       make(map[uint64]bool),
-		missing:    make(map[uint64]time.Time),
-		buffer:     make(map[uint64]*Chunk),
-		allDone:    make(chan struct{}),
-	}
-	r.dropSeqs = parseDropSeqs()
-	return r
 }
 
-// parseDropSeqs reads MULTISEND_TEST_DROP_SEQS (comma-separated seq numbers)
+// parseDropSeqs reads MULTISEND_TEST_DROP_SEQS (comma-separated seq numbers),
 // used only for automated tests to exercise the resend path.
 func parseDropSeqs() map[uint64]bool {
 	env := os.Getenv("MULTISEND_TEST_DROP_SEQS")
@@ -79,171 +65,74 @@ func parseDropSeqs() map[uint64]bool {
 	return m
 }
 
-func (r *Receiver) Run() error {
-	for i := 0; i < r.numStreams; i++ {
-		if err := r.connectStream(i); err != nil {
-			return err
-		}
-	}
-
-	for i := 0; i < r.numStreams; i++ {
-		go r.recvLoop(i)
-	}
-	go r.resendLoop()
-	go r.writeLoop()
-
-	<-r.allDone
-
-	r.receiveMu.Lock()
-	r.drain()
-	r.receiveMu.Unlock()
-
-	chunkSize := atomic.LoadInt64(&r.chunkSize)
-	if chunkSize < 1 {
-		chunkSize = 1
-	}
-	r.prog.Final(atomic.LoadUint64(&r.totalRecv), atomic.LoadUint64(&r.totalRecv)/uint64(chunkSize))
-
-	for i := 0; i < r.numStreams; i++ {
-		if r.conns[i] != nil {
-			r.conns[i].Close()
-		}
-	}
-	return nil
-}
-
-func (r *Receiver) connectStream(i int) error {
-	port := r.basePort + i
-	addr := net.JoinHostPort(r.senderHost, fmt.Sprintf("%d", port))
-	for attempt := 0; ; attempt++ {
-		conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
-		if err == nil {
-			r.conns[i] = conn
-			r.writers[i] = NewMsgWriter(conn)
-			fmt.Fprintf(os.Stderr, "%s%s stream %d connected to %s%s\n",
-				Green, Bold, i+1, addr, Reset)
-			return nil
-		}
-		if attempt >= 5 {
-			return fmt.Errorf("stream %d: failed to connect after %d attempts: %w", i+1, attempt+1, err)
-		}
-		fmt.Fprintf(os.Stderr, "%sstream %d: connect failed, retrying (%d/5)...%s\n",
-			Yellow, i+1, attempt+1, Reset)
-		time.Sleep(time.Duration(attempt+1) * time.Second)
-	}
-}
-
-func (r *Receiver) reconnectStream(i int) error {
-	if r.conns[i] != nil {
-		r.conns[i].Close()
-	}
-	return r.connectStream(i)
-}
-
-func (r *Receiver) handleHello(streamIdx int, msg *Message) {
+func (r *inFlow) onHello(msg *Message) {
 	if len(msg.Data) != HelloSizeLen {
-		fmt.Fprintf(os.Stderr, "%s%s stream %d: bad hello payload length %d%s\n",
-			Red, Bold, streamIdx+1, len(msg.Data), Reset)
+		r.prog.Log("%s%s peer advertised a malformed hello%s", Red, Bold, Reset)
 		return
 	}
 	sz := int64(binary.BigEndian.Uint64(msg.Data))
-	if atomic.LoadInt64(&r.chunkSize) == 0 && sz > 0 {
-		atomic.StoreInt64(&r.chunkSize, sz)
-		fmt.Fprintf(os.Stderr, "%s%s sender advertised chunk size %d bytes%s\n",
-			Green, Bold, sz, Reset)
+	if r.chunkSize.Load() == 0 && sz > 0 {
+		r.chunkSize.Store(sz)
+		r.prog.Log("%s%s peer advertised chunk size %d bytes%s", Green, Bold, sz, Reset)
 	}
 }
 
-func (r *Receiver) recvLoop(streamIdx int) {
-	for {
-		select {
-		case <-r.allDone:
-			return
-		default:
-		}
-		msg, err := readMsgDeadline(r.conns[streamIdx], r.connTmo)
-		if err != nil {
-			if isTimeout(err) {
-				// Peer went silent beyond the timeout: kill and reconnect.
-				fmt.Fprintf(os.Stderr, "%s%s stream %d: idle for %v, deemed dead, reconnecting...%s\n",
-					Yellow, Bold, streamIdx+1, r.connTmo, Reset)
-			} else if err == io.EOF || isClosedError(err) {
-				return
-			} else {
-				fmt.Fprintf(os.Stderr, "%s%s stream %d: read error: %v, reconnecting...%s\n",
-					Yellow, Bold, streamIdx+1, err, Reset)
-			}
-			if rerr := r.reconnectStream(streamIdx); rerr != nil {
-				fmt.Fprintf(os.Stderr, "%s%s stream %d: reconnect failed: %v%s\n",
-					Red, Bold, streamIdx+1, rerr, Reset)
-				return
-			}
-			continue
-		}
+func (r *inFlow) onData(streamIdx int, msg *Message) {
+	if r.dropSeqs[msg.Seq] {
+		delete(r.dropSeqs, msg.Seq)
+		r.prog.Log("%s%s TEST: dropping seq %d on stream %d%s", BoldRed, Bold, msg.Seq, streamIdx+1, Reset)
+		return
+	}
 
-		// Hello (chunk size advertisement) may appear at any point, including
-		// right after a reconnect, before any data messages.
-		if msg.Type == MsgHello {
-			r.handleHello(streamIdx, msg)
-			continue
-		}
-
-		switch msg.Type {
-		case MsgData:
-			// test-only: drop the chunk one time so the missing detection +
-			// resend + sender retransmit path can be exercised.
-			if r.dropSeqs[msg.Seq] {
-				delete(r.dropSeqs, msg.Seq)
-				fmt.Fprintf(os.Stderr, "%s%s TEST: dropping seq %d on stream %d%s\n",
-					BoldRed, Bold, msg.Seq, streamIdx+1, Reset)
-				continue
-			}
-			r.receiveMu.Lock()
-			if msg.Seq >= r.expectedSeq {
-				if !r.seen[msg.Seq] {
-					r.seen[msg.Seq] = true
-					r.buffer[msg.Seq] = &Chunk{Seq: msg.Seq, Data: msg.Data}
-					delete(r.missing, msg.Seq)
-					if msg.Seq > r.maxSeen {
-						// mark the gap between expectedSeq and msg.Seq as missing
-						for s := r.maxSeen + 1; s < msg.Seq; s++ {
-							if !r.seen[s] {
-								if _, ok := r.missing[s]; !ok {
-									r.missing[s] = time.Now()
-								}
-							}
+	r.receiveMu.Lock()
+	if msg.Seq >= r.expectedSeq {
+		if !r.seen[msg.Seq] {
+			r.seen[msg.Seq] = true
+			r.buffer[msg.Seq] = &Chunk{Seq: msg.Seq, Data: msg.Data}
+			delete(r.missing, msg.Seq)
+			if msg.Seq > r.maxSeen {
+				for s := r.maxSeen + 1; s < msg.Seq; s++ {
+					if !r.seen[s] {
+						if _, ok := r.missing[s]; !ok {
+							r.missing[s] = time.Now()
 						}
-						r.maxSeen = msg.Seq
 					}
 				}
-			}
-			r.receiveMu.Unlock()
-
-			r.prog.AddBytes(uint64(len(msg.Data)))
-			r.prog.AddStreamBytes(streamIdx, uint64(len(msg.Data)))
-			atomic.AddUint64(&r.totalRecv, uint64(len(msg.Data)))
-
-			if wErr := r.writers[streamIdx].WriteMsg(&Message{Type: MsgACK, Seq: msg.Seq}); wErr != nil {
-				fmt.Fprintf(os.Stderr, "%s%s stream %d: ack write error: %v%s\n",
-					Red, Bold, streamIdx+1, wErr, Reset)
-			}
-
-		case MsgDONE:
-			count := atomic.AddInt32(&r.doneCount, 1)
-			if count == int32(r.numStreams) {
-				// signal end; given time for stragglers to be flushed
-				go func() {
-					time.Sleep(r.resendTmo + time.Second)
-					close(r.allDone)
-				}()
+				r.maxSeen = msg.Seq
 			}
 		}
 	}
+	r.receiveMu.Unlock()
+
+	r.recvTotal.Add(uint64(len(msg.Data)))
+	r.recvChunks.Add(1)
+	r.prog.AddRecvBytes(uint64(len(msg.Data)))
+	r.prog.AddRecvStreamBytes(streamIdx, uint64(len(msg.Data)))
+
+	// Acknowledge on the same stream the chunk arrived on.
+	if err := r.conns[streamIdx].send(&Message{Type: MsgACK, Seq: msg.Seq}); err != nil {
+		r.prog.Log("%s%s stream %d: ack failed: %v%s", Red, Bold, streamIdx+1, err, Reset)
+	}
 }
 
-// drain writes all buffered contiguous chunks to stdout, advancing expectedSeq.
-// Caller must hold receiveMu.
-func (r *Receiver) drain() {
+// onDONE counts one finished out-stream of the peer; when every stream has
+// delivered its DONE the receive half completes after a grace period that
+// lets stragglers and retransmits arrive.
+func (r *inFlow) onDONE() {
+	count := atomic.AddInt32(&r.doneCount, 1)
+	if count == int32(len(r.conns)) {
+		r.doneOnce.Do(func() {
+			go func() {
+				time.Sleep(r.resendTmo + time.Second)
+				close(r.done)
+			}()
+		})
+	}
+}
+
+// drain writes all buffered contiguous chunks to stdout, advancing
+// expectedSeq. Caller must hold receiveMu.
+func (r *inFlow) drain() {
 	for {
 		chk, ok := r.buffer[r.expectedSeq]
 		if !ok {
@@ -256,39 +145,43 @@ func (r *Receiver) drain() {
 	}
 }
 
-// writeLoop periodically drains the buffer to stdout and updates progress.
-func (r *Receiver) writeLoop() {
+// writeLoop periodically drains the reordered buffer to stdout and refreshes
+// the receive side of the progress display.
+func (r *inFlow) writeLoop() {
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-r.allDone:
+		case <-r.done:
 			return
 		case <-ticker.C:
 			r.receiveMu.Lock()
 			r.drain()
-			outOfOrder := len(r.buffer)
-			missingCount := len(r.missing)
+			buffered := len(r.buffer)
+			missing := len(r.missing)
 			r.receiveMu.Unlock()
-			var extra string
-			if outOfOrder > 0 || missingCount > 0 {
-				extra = fmt.Sprintf("%s buffered=%d missing=%d%s", Yellow, outOfOrder, missingCount, Reset)
-			} else {
-				extra = ""
-			}
-			r.prog.Tick(atomic.LoadUint64(&r.totalRecv), extra)
+			r.prog.SetBuffer(buffered, missing)
+			r.prog.Tick(0, r.recvTotal.Load())
 		}
 	}
 }
 
-// resendLoop periodically checks if any missing chunk has been missing
-// longer than resendTmo and requests retransmission.
-func (r *Receiver) resendLoop() {
+// flushFinal drains whatever is still buffered when the node is shutting
+// down (late arrivals that raced the DONE grace period).
+func (r *inFlow) flushFinal() {
+	r.receiveMu.Lock()
+	r.drain()
+	r.receiveMu.Unlock()
+}
+
+// resendLoop requests retransmission of chunks that have been missing longer
+// than resendTmo.
+func (r *inFlow) resendLoop() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-r.allDone:
+		case <-r.done:
 			return
 		case <-ticker.C:
 			now := time.Now()
@@ -297,8 +190,7 @@ func (r *Receiver) resendLoop() {
 			for seq, since := range r.missing {
 				if now.Sub(since) > r.resendTmo {
 					toRequest = append(toRequest, seq)
-					// reset timer so we don't spam
-					r.missing[seq] = now
+					r.missing[seq] = now // reset timer so we don't spam
 				}
 			}
 			r.receiveMu.Unlock()
@@ -309,12 +201,10 @@ func (r *Receiver) resendLoop() {
 	}
 }
 
-func (r *Receiver) requestResend(seq uint64) {
-	for i := 0; i < r.numStreams; i++ {
-		if r.conns[i] != nil {
-			if err := r.writers[i].WriteMsg(&Message{Type: MsgRESEND, Seq: seq}); err == nil {
-				fmt.Fprintf(os.Stderr, "%s%s requested resend seq %d on stream %d%s\n",
-					Magenta, Bold, seq, i+1, Reset)
+func (r *inFlow) requestResend(seq uint64) {
+	for _, c := range r.conns {
+		if c.isConnected() {
+			if err := c.send(&Message{Type: MsgRESEND, Seq: seq}); err == nil {
 				return
 			}
 		}

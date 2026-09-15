@@ -2,328 +2,337 @@ package main
 
 import (
 	"bufio"
-	"encoding/binary"
-	"fmt"
 	"io"
-	"net"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type StreamState struct {
-	mu      sync.Mutex
-	conn    net.Conn
-	writer  *MsgWriter
-	bytesIn uint64 // received from this peer (during this stream lifetime)
+// outFlow is the transmitting half of a bidirectional node. It reads stdin,
+// splits the stream into numbered chunks, and distributes them across the
+// connected streams. The queue mode determines which stream gets the next
+// chunk:
+//   - "round-robin" (default): simple round-robin over connected streams,
+//     skipping down streams.
+//   - "least-unacked": sends the next chunk to the connected stream with the
+//     fewest unacked (sent-but-not-yet-ACKed) chunks, so a stream that falls
+//     behind automatically receives less new data.
+// Chunks that cannot be handed to a live stream sit in `unsent` (and in
+// `pending`) until a stream is restored, then they are flushed before new
+// data, so nothing is lost when all connections drop at once.
+type outFlow struct {
+	conns     []*Conn
+	chunkSize int
+	resendTmo time.Duration
+	noInput   bool
+	prog      *ProgressDisplay
+	mode      string // "round-robin" or "least-unacked"
+
+	pending    sync.Map // seq -> *Chunk, kept until ACKed
+	chunkStream sync.Map // seq -> int (stream idx the chunk was sent on)
+	unsent     []*Chunk
+	unsentMu   sync.Mutex
+	nextSeq    uint64
+	rr         uint64
+	numChunks  uint64
+	sendTotal  atomic.Uint64
+	acked      atomic.Uint64
+	eof        atomic.Bool
+	done       chan struct{}
+
+	// per-stream unacked-chunk counters (least-unacked mode). Written by the
+	// Run goroutine and by the reader goroutines on ACK; hence atomic.
+	pendingPerCnt []atomic.Int32
 }
 
-func (ss *StreamState) setConn(c net.Conn) {
-	ss.mu.Lock()
-	ss.conn = c
-	ss.writer = NewMsgWriter(c)
-	ss.mu.Unlock()
-}
-
-func (ss *StreamState) getWriter() *MsgWriter {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	return ss.writer
-}
-
-func (ss *StreamState) getConn() net.Conn {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	return ss.conn
-}
-
-func (ss *StreamState) closeConn() {
-	ss.mu.Lock()
-	if ss.conn != nil {
-		ss.conn.Close()
-	}
-	ss.mu.Unlock()
-}
-
-type Sender struct {
-	basePort   int
-	numStreams int
-	chunkSize  int
-	connTmo    time.Duration
-	resendTmo  time.Duration
-
-	listeners []net.Listener
-	streams   []*StreamState
-	// round-robin cursor
-	rr uint64
-
-	pending   sync.Map // seq -> *Chunk
-	nextSeq   uint64
-	totalSent uint64
-	acked     uint64
-
-	prog *ProgressDisplay
-	done chan struct{}
-}
-
-func NewSender(basePort, numStreams, chunkSize int, connTmo, resendTmo time.Duration, progress ...bool) *Sender {
-	enabled := true
-	if len(progress) > 0 {
-		enabled = progress[0]
-	}
-	return &Sender{
-		basePort:   basePort,
-		numStreams: numStreams,
-		chunkSize:  chunkSize,
-		connTmo:    connTmo,
-		resendTmo:  resendTmo,
-		listeners:  make([]net.Listener, numStreams),
-		streams:    make([]*StreamState, numStreams),
-		prog:       NewProgressDisplay("sender", numStreams, chunkSize, enabled),
-		done:       make(chan struct{}),
+func newOutFlow(conns []*Conn, chunkSize int, resendTmo time.Duration, prog *ProgressDisplay, mode string) *outFlow {
+	return &outFlow{
+		conns:         conns,
+		chunkSize:     chunkSize,
+		resendTmo:     resendTmo,
+		prog:          prog,
+		mode:          mode,
+		done:          make(chan struct{}),
+		pendingPerCnt: make([]atomic.Int32, len(conns)),
 	}
 }
 
-// sendHello advertises the chunk size on the given stream's current connection.
-func (s *Sender) sendHello(streamIdx int) error {
-	hello := make([]byte, HelloSizeLen)
-	binary.BigEndian.PutUint64(hello, uint64(s.chunkSize))
-	w := s.streams[streamIdx].getWriter()
-	if w == nil {
-		return fmt.Errorf("stream %d has no writer", streamIdx)
+// nextConn picks the stream for the next chunk according to the queue mode.
+func (o *outFlow) nextConn() *Conn {
+	if o.mode == "least-unacked" {
+		return o.nextConnLeastUnacked()
 	}
-	return w.WriteMsg(&Message{Type: MsgHello, Seq: 0, Data: hello})
+	return o.nextConnRoundRobin()
 }
 
-func (s *Sender) Run() error {
-	for i := 0; i < s.numStreams; i++ {
-		addr := fmt.Sprintf(":%d", s.basePort+i)
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			return fmt.Errorf("listen on %s: %w", addr, err)
-		}
-		s.listeners[i] = ln
-		s.streams[i] = &StreamState{}
-		fmt.Fprintf(os.Stderr, "%s%s listening on %s (stream %d/%d)%s\n",
-			BoldCyan, Bold, addr, i+1, s.numStreams, Reset)
-	}
-
-	// Wait for initial connections from all N streams
-	for i := 0; i < s.numStreams; i++ {
-		conn, err := s.listeners[i].Accept()
-		if err != nil {
-			return fmt.Errorf("accept stream %d: %w", i+1, err)
-		}
-		s.streams[i].setConn(conn)
-		fmt.Fprintf(os.Stderr, "%s%s stream %d connected from %s%s\n",
-			Green, Bold, i+1, conn.RemoteAddr(), Reset)
-
-		// Advertise the chunk size on every connection.
-		if err := s.sendHello(i); err != nil {
-			return fmt.Errorf("send hello on stream %d: %w", i+1, err)
+// nextConnRoundRobin returns the next connected stream in round-robin order,
+// or nil if every stream is currently down (the caller then queues the chunk
+// instead of attempting a doomed write).
+func (o *outFlow) nextConnRoundRobin() *Conn {
+	start := o.rr
+	for i := 0; i < len(o.conns); i++ {
+		idx := int(o.rr % uint64(len(o.conns)))
+		o.rr++
+		if o.conns[idx].isConnected() {
+			return o.conns[idx]
 		}
 	}
-
-	// One goroutine handles read-loop + re-accept for each stream
-	for i := 0; i < s.numStreams; i++ {
-		go s.manageStream(i)
-	}
-
-	err := s.readStdin()
-	<-s.done
-	return err
+	o.rr = start
+	return nil
 }
 
-// manageStream keeps the stream alive: reads ACKs/RESENDs, and when the
-// connection drops, accepts a replacement on the listener.
-func (s *Sender) manageStream(streamIdx int) {
-	for {
-		conn := s.streams[streamIdx].getConn()
-		if conn == nil {
-			time.Sleep(50 * time.Millisecond)
+// nextConnLeastUnacked returns the connected stream with the fewest unacked
+// chunks; among equal counts the first one encountered (scanning round-robin
+// from the current pointer) wins, and nil if no stream is connected.
+func (o *outFlow) nextConnLeastUnacked() *Conn {
+	n := len(o.conns)
+	bestIdx := -1
+	var bestCount int32
+	for checked := 0; checked < n; checked++ {
+		idx := int(o.rr % uint64(n))
+		o.rr++
+		if !o.conns[idx].isConnected() {
 			continue
 		}
-
-		msg, err := readMsgDeadline(conn, s.connTmo)
-		if err != nil {
-			s.streams[streamIdx].closeConn()
-			switch {
-			case isTimeout(err):
-				fmt.Fprintf(os.Stderr, "%s%s stream %d: idle for %v, deemed dead, re-establishing...%s\n",
-					Yellow, Bold, streamIdx+1, s.connTmo, Reset)
-			default:
-				fmt.Fprintf(os.Stderr, "%s%s stream %d: connection dropped: %v, re-establishing...%s\n",
-					Yellow, Bold, streamIdx+1, err, Reset)
-			}
-		} else {
-			s.handleControl(msg, streamIdx)
-			// loop back to read the next message on the same connection
-			continue
-		}
-
-		// Re-accept a new connection on this listener
-		for {
-			if !s.alive() {
-				return
-			}
-			conn, aerr := s.listeners[streamIdx].Accept()
-			if aerr != nil {
-				if isClosedError(aerr) {
-					return
-				}
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			s.streams[streamIdx].setConn(conn)
-			fmt.Fprintf(os.Stderr, "%s%s stream %d reconnected from %s%s\n",
-				Green, Bold, streamIdx+1, conn.RemoteAddr(), Reset)
-			if err := s.sendHello(streamIdx); err != nil {
-				fmt.Fprintf(os.Stderr, "%s%s stream %d: hello write failed: %v%s\n",
-					Red, Bold, streamIdx+1, err, Reset)
-			}
-			break
+		cnt := o.pendingPerCnt[idx].Load()
+		if bestIdx < 0 || cnt < bestCount {
+			bestCount = cnt
+			bestIdx = idx
 		}
 	}
-}
-
-func (s *Sender) handleControl(msg *Message, streamIdx int) {
-	switch msg.Type {
-	case MsgACK:
-		s.pending.Delete(msg.Seq)
-		atomic.AddUint64(&s.acked, 1)
-	case MsgRESEND:
-		go s.retransmit(msg.Seq, streamIdx)
-	}
-}
-
-func (s *Sender) alive() bool {
-	select {
-	case <-s.done:
-		return false
-	default:
-		return true
-	}
-}
-
-// waitForDrain blocks until all pending chunks are ACKed or a timeout expires.
-func (s *Sender) waitForDrain() {
-	deadline := time.After(s.resendTmo * 2)
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		count := 0
-		s.pending.Range(func(_, _ any) bool { count++; return true })
-		if count == 0 {
-			return
-		}
-		select {
-		case <-deadline:
-			count = 0
-			s.pending.Range(func(_, _ any) bool { count++; return true })
-			fmt.Fprintf(os.Stderr, "%s%s warning: %d chunks still pending after timeout, proceeding%s\n",
-				Yellow, Bold, count, Reset)
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-func (s *Sender) retransmit(seq uint64, streamIdx int) {
-	val, ok := s.pending.Load(seq)
-	if !ok {
-		return
-	}
-	chk := val.(*Chunk)
-	fmt.Fprintf(os.Stderr, "%s%s stream %d: retransmit seq %d (%d bytes)%s\n",
-		Magenta, Bold, streamIdx+1, seq, len(chk.Data), Reset)
-	w := s.streams[streamIdx].getWriter()
-	if w == nil {
-		return
-	}
-	if err := w.WriteMsg(&Message{Type: MsgData, Seq: seq, Data: chk.Data}); err != nil {
-		fmt.Fprintf(os.Stderr, "%s%s stream %d: retransmit write error: %v%s\n",
-			Red, Bold, streamIdx+1, err, Reset)
-	}
-}
-
-// sendChunkTo sends a chunk to stream streamIdx (round-robin assignment).
-func (s *Sender) sendChunkTo(streamIdx int, chk *Chunk) error {
-	w := s.streams[streamIdx].getWriter()
-	if w == nil {
-		return fmt.Errorf("stream %d has no writer", streamIdx)
-	}
-	s.prog.AddStreamBytes(streamIdx, uint64(len(chk.Data)))
-	return w.WriteMsg(&Message{Type: MsgData, Seq: chk.Seq, Data: chk.Data})
-}
-
-func (s *Sender) readStdin() error {
-	reader := bufio.NewReaderSize(os.Stdin, s.chunkSize*2)
-
-	for {
-		buf := make([]byte, s.chunkSize)
-		n, err := io.ReadFull(reader, buf)
-		if n > 0 {
-			seq := atomic.AddUint64(&s.nextSeq, 1) - 1
-			chk := &Chunk{Seq: seq, Data: buf[:n]}
-
-			s.pending.Store(seq, chk)
-			s.prog.AddBytes(uint64(n))
-			atomic.AddUint64(&s.totalSent, uint64(n))
-
-			idx := int(s.rr % uint64(s.numStreams))
-			s.rr++
-			if werr := s.sendChunkTo(idx, chk); werr != nil {
-				// Will be retransmitted if the receiver requests it.
-				fmt.Fprintf(os.Stderr, "%s%s stream %d: write error: %v (queued for resend)%s\n",
-					Red, Bold, idx+1, werr, Reset)
-			}
-
-			pending := atomic.LoadUint64(&s.totalSent) - atomic.LoadUint64(&s.acked)
-			extra := fmt.Sprintf("%s pending=%s%s", Yellow, formatBytes(pending), Reset)
-			if s.streams[idx].getConn() == nil {
-				extra += fmt.Sprintf("%s stream%d=DOWN%s", BoldRed, idx+1, Reset)
-			}
-			s.prog.Tick(atomic.LoadUint64(&s.totalSent), extra)
-		}
-		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
-			}
-			return fmt.Errorf("stdin read: %w", err)
-		}
-	}
-
-	// Flush DONE markers on all streams
-	var wg sync.WaitGroup
-	for i := 0; i < s.numStreams; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			w := s.streams[idx].getWriter()
-			if w != nil {
-				_ = w.WriteMsg(&Message{Type: MsgDONE, Seq: 0})
-			}
-		}(i)
-	}
-	wg.Wait()
-
-	// Wait for all pending chunks to be ACKed, or for a generous timeout
-	// that gives the receiver time to detect missing chunks and request resend.
-	s.waitForDrain()
-	s.prog.Final(atomic.LoadUint64(&s.totalSent), atomic.LoadUint64(&s.acked))
-	close(s.done)
-
-	for i := 0; i < s.numStreams; i++ {
-		s.streams[i].closeConn()
-		s.listeners[i].Close()
+	if bestIdx >= 0 {
+		return o.conns[bestIdx]
 	}
 	return nil
 }
 
-func isClosedError(err error) bool {
-	if err == nil {
+// markSent records that a chunk left on stream idx: bump its unacked count,
+// remember which stream owns it (so the ACK can be attributed), and update
+// the progress weight counter.
+func (o *outFlow) markSent(c *Conn, chk *Chunk) {
+	o.chunkStream.Store(chk.Seq, c.idx)
+	o.pendingPerCnt[c.idx].Add(1)
+	o.prog.AddSentChunk(c.idx)
+}
+
+// flushUnsent hands every queued chunk to one specific stream, preserving
+// order; chunks that fail to send are re-queued at the head.
+func (o *outFlow) flushUnsent(c *Conn) int {
+	o.unsentMu.Lock()
+	if len(o.unsent) == 0 {
+		o.unsentMu.Unlock()
+		return 0
+	}
+	q := o.unsent
+	o.unsent = nil
+	o.unsentMu.Unlock()
+
+	n := 0
+	for i, chk := range q {
+		o.prog.AddStreamBytes(c.idx, uint64(len(chk.Data)))
+		if err := c.send(&Message{Type: MsgData, Seq: chk.Seq, Data: chk.Data}); err != nil {
+			o.unsentMu.Lock()
+			o.unsent = append(o.unsent, q[i:]...)
+			o.unsentMu.Unlock()
+			break
+		}
+		o.markSent(c, chk)
+		n++
+	}
+	return n
+}
+
+func (o *outFlow) flushUnsentToAnyConnected() {
+	for _, c := range o.conns {
+		if c.isConnected() {
+			o.flushUnsent(c)
+		}
+	}
+}
+
+func (o *outFlow) pendingCount() int {
+	count := 0
+	o.pending.Range(func(_, _ any) bool { count++; return true })
+	return count
+}
+
+// onConnEstablished is called whenever a stream's socket is (re)established:
+// queued chunks are flushed, and if stdin already reached EOF a DONE marker
+// is sent on the fresh socket so the peer's receive half can complete even
+// though that stream's original DONE was lost with the dead socket.
+func (o *outFlow) onConnEstablished(c *Conn) {
+	o.flushUnsent(c)
+	if o.eof.Load() {
+		o.prog.Log("%s%s stream %d resumed after end-of-stream, confirming DONE%s",
+			Cyan, Bold, c.idx+1, Reset)
+		_ = c.send(&Message{Type: MsgDONE})
+	}
+}
+
+func (o *outFlow) sendDoneOnAll() {
+	for _, c := range o.conns {
+		if c.isConnected() {
+			_ = c.send(&Message{Type: MsgDONE})
+		}
+	}
+}
+
+// waitForDrain blocks until every pending chunk is ACKed. It never gives up
+// while the peer might still be alive: if a stream is restored the queued
+// chunks are flushed, and if the peer is really gone the process waits until
+// it returns (mirroring the "stay up until the other side finishes" contract).
+func (o *outFlow) waitForDrain() {
+	grace := time.Now().Add(o.resendTmo * 2)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	warned := false
+	for {
+		o.flushUnsentToAnyConnected()
+		if o.pendingCount() == 0 {
+			return
+		}
+		<-ticker.C
+		if time.Now().After(grace) && !warned {
+			warned = true
+			o.prog.Log("%s%s %d chunks still unacknowledged; staying up for the peer%s",
+				Yellow, Bold, o.pendingCount(), Reset)
+		}
+	}
+}
+
+// Run reads stdin until EOF, then sends DONE on every stream, waits for the
+// outstanding chunks to be acknowledged, and closes `done`.
+func (o *outFlow) Run() {
+	defer close(o.done)
+	if o.noInput {
+		o.prog.Log("%s%s stdin is a terminal; nothing to transmit%s", Yellow, Bold, Reset)
+		o.eof.Store(true)
+		o.sendDoneOnAll()
+		return
+	}
+
+	reader := bufio.NewReaderSize(os.Stdin, o.chunkSize*2)
+	for {
+		buf := make([]byte, o.chunkSize)
+		n, err := io.ReadFull(reader, buf)
+		if n > 0 {
+			o.enqueue(buf[:n])
+			o.prog.Tick(o.sendTotal.Load(), 0)
+		}
+		if err != nil {
+			if err != io.EOF && err != io.ErrUnexpectedEOF {
+				o.prog.Log("%s%s stdin read error: %v%s", Red, Bold, err, Reset)
+			}
+			break
+		}
+	}
+
+	o.eof.Store(true)
+	o.sendDoneOnAll()
+	o.waitForDrain()
+	o.prog.SetPending(0)
+}
+
+// enqueue stores and transmits one chunk, flushing any backlog of unsent
+// chunks on the same stream first when one is available. The queue mode
+// determines which stream gets the chunk.
+func (o *outFlow) enqueue(data []byte) {
+	seq := atomic.AddUint64(&o.nextSeq, 1) - 1
+	chk := &Chunk{Seq: seq, Data: data}
+	o.pending.Store(seq, chk)
+	o.numChunks++
+	o.sendTotal.Add(uint64(len(data)))
+	o.prog.AddBytes(uint64(len(data)))
+	o.prog.SetPending(o.pendingCount())
+
+	o.unsentMu.Lock()
+	queued := len(o.unsent)
+	o.unsentMu.Unlock()
+
+	if c := o.nextConn(); c != nil {
+		if queued > 0 {
+			// new data must never overtake chunks that were queued while
+			// every stream was down
+			o.flushUnsent(c)
+		}
+		o.sendChunk(c, chk)
+	} else {
+		o.unsentMu.Lock()
+		o.unsent = append(o.unsent, chk)
+		o.unsentMu.Unlock()
+	}
+}
+
+func (o *outFlow) sendChunk(c *Conn, chk *Chunk) bool {
+	o.prog.AddStreamBytes(c.idx, uint64(len(chk.Data)))
+	if err := c.send(&Message{Type: MsgData, Seq: chk.Seq, Data: chk.Data}); err != nil {
+		o.unsentMu.Lock()
+		o.unsent = append(o.unsent, chk)
+		o.unsentMu.Unlock()
+		o.prog.Log("%s%s stream %d: send failed: %v (queued)%s", Red, Bold, c.idx+1, err, Reset)
 		return false
 	}
-	return fmt.Sprintf("%v", err) == "use of closed network connection"
+	o.markSent(c, chk)
+	return true
+}
+
+// decrPending atomically decrements a stream's unacked-chunk counter, never
+// below zero.
+func (o *outFlow) decrPending(idx int) {
+	if idx < 0 || idx >= len(o.pendingPerCnt) {
+		return
+	}
+	for {
+		cur := o.pendingPerCnt[idx].Load()
+		if cur <= 0 {
+			return
+		}
+		if o.pendingPerCnt[idx].CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
+
+func (o *outFlow) handleACK(seq uint64) {
+	o.pending.Delete(seq)
+	o.acked.Add(1)
+	if v, ok := o.chunkStream.LoadAndDelete(seq); ok {
+		if idx, ok := v.(int); ok {
+			o.decrPending(idx)
+		}
+	}
+	o.prog.SetPending(o.pendingCount())
+}
+
+func (o *outFlow) handleRESEND(seq uint64, from *Conn) {
+	val, ok := o.pending.Load(seq)
+	if !ok || from == nil {
+		return
+	}
+	chk := val.(*Chunk)
+	o.prog.RecordRetransmit(from.idx)
+	if err := from.send(&Message{Type: MsgData, Seq: seq, Data: chk.Data}); err != nil {
+		o.prog.Log("%s%s stream %d: retransmit failed: %v%s", Red, Bold, from.idx+1, err, Reset)
+		return
+	}
+	o.prog.AddSentChunk(from.idx)
+	o.reassign(seq, from)
+}
+
+// reassign moves the unacked-chunk ownership of seq to the stream that now
+// physically carries it after a retransmission.
+func (o *outFlow) reassign(seq uint64, to *Conn) {
+	fromIdx := -1
+	if v, ok := o.chunkStream.LoadAndDelete(seq); ok {
+		fromIdx, _ = v.(int)
+	}
+	o.chunkStream.Store(seq, to.idx)
+	if fromIdx == to.idx {
+		return
+	}
+	o.decrPending(fromIdx)
+	if to.idx >= 0 && to.idx < len(o.pendingPerCnt) {
+		o.pendingPerCnt[to.idx].Add(1)
+	}
 }

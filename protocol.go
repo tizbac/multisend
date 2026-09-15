@@ -10,11 +10,12 @@ import (
 )
 
 const (
-	MsgData   byte = 1
-	MsgACK    byte = 2
-	MsgRESEND byte = 3
-	MsgDONE   byte = 4
-	MsgHello  byte = 5
+	MsgData    byte = 1
+	MsgACK     byte = 2
+	MsgRESEND  byte = 3
+	MsgDONE    byte = 4
+	MsgHello   byte = 5
+	MsgStreamID byte = 6
 
 	MsgHdrSize = 1 + 8 + 4 // type(1) + seq(8) + datalen(4) = 13
 )
@@ -22,6 +23,13 @@ const (
 // Hello carries the sender's chunk size (as 8-byte big-endian) so the
 // receiver learns it from the wire instead of a CLI flag.
 const HelloSizeLen = 8
+
+// helloFor encodes the chunk size as an 8-byte big-endian Hello payload.
+func helloFor(chunkSize int) []byte {
+	b := make([]byte, HelloSizeLen)
+	binary.BigEndian.PutUint64(b, uint64(chunkSize))
+	return b
+}
 
 type Message struct {
 	Type byte

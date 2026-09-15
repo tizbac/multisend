@@ -19,6 +19,16 @@ func stderrIsTTY() bool {
 	return errno == 0
 }
 
+// stdinIsTTY reports whether stdin is an interactive terminal (not a pipe).
+// When it is, the bidirectional node treats it as "no input" so it sends
+// nothing instead of blocking forever waiting for terminal input.
+func stdinIsTTY() bool {
+	fd := os.Stdin.Fd()
+	var termios syscall.Termios
+	_, _, errno := syscall.Syscall6(syscall.SYS_IOCTL, fd, ioctlTCGETS, uintptr(unsafe.Pointer(&termios)), 0, 0, 0)
+	return errno == 0
+}
+
 type winsize struct {
 	Row, Col       uint16
 	Xpixel, Ypixel uint16
