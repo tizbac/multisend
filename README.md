@@ -1,5 +1,9 @@
 # multisend
 
+<img width="603" height="380" alt="image" src="https://github.com/user-attachments/assets/d1a06cee-f335-428b-823a-cd4c6f97d865" />
+<img width="610" height="322" alt="image" src="https://github.com/user-attachments/assets/ef008455-298a-4e9a-873d-f38e5b9895c8" />
+
+
 Parallel TCP stream multiplexer for piped data.
 
 `multisend` reads data from stdin, splits it into numbered chunks, and
