@@ -130,23 +130,29 @@ func (r *inFlow) onDONE() {
 	}
 }
 
-// drain writes all buffered contiguous chunks to stdout, advancing
-// expectedSeq. Caller must hold receiveMu.
-func (r *inFlow) drain() {
+// drain collects all buffered contiguous chunks to stdout, advancing
+// expectedSeq. It returns the chunk payloads and pops them from the maps, so
+// the caller can write them out without holding receiveMu (a stalled stdout
+// consumer must not be able to wedge the receive path or the ACK loop).
+// Caller must hold receiveMu.
+func (r *inFlow) drain() [][]byte {
+	var out [][]byte
 	for {
 		chk, ok := r.buffer[r.expectedSeq]
 		if !ok {
 			break
 		}
-		os.Stdout.Write(chk.Data)
+		out = append(out, chk.Data)
 		delete(r.buffer, r.expectedSeq)
 		delete(r.seen, r.expectedSeq)
 		r.expectedSeq++
 	}
+	return out
 }
 
 // writeLoop periodically drains the reordered buffer to stdout and refreshes
-// the receive side of the progress display.
+// the receive side of the progress display. Writes to stdout happen outside
+// receiveMu so a slow consumer cannot stall ACK processing or the redraw tick.
 func (r *inFlow) writeLoop() {
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
@@ -156,10 +162,13 @@ func (r *inFlow) writeLoop() {
 			return
 		case <-ticker.C:
 			r.receiveMu.Lock()
-			r.drain()
+			out := r.drain()
 			buffered := len(r.buffer)
 			missing := len(r.missing)
 			r.receiveMu.Unlock()
+			for _, d := range out {
+				os.Stdout.Write(d)
+			}
 			r.prog.SetBuffer(buffered, missing)
 			r.prog.Tick(0, r.recvTotal.Load())
 		}
@@ -170,8 +179,11 @@ func (r *inFlow) writeLoop() {
 // down (late arrivals that raced the DONE grace period).
 func (r *inFlow) flushFinal() {
 	r.receiveMu.Lock()
-	r.drain()
+	out := r.drain()
 	r.receiveMu.Unlock()
+	for _, d := range out {
+		os.Stdout.Write(d)
+	}
 }
 
 // resendLoop requests retransmission of chunks that have been missing longer

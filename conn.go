@@ -88,7 +88,10 @@ func (c *Conn) isConnected() bool {
 }
 
 // send writes one message on the stream's current socket (no-op style error
-// when disconnected).
+// when disconnected). The write carries a deadline so a peer that stops
+// reading (network partition, stopped process) fails the write instead of
+// blocking the calling goroutine forever; reads already use connTmo via
+// readMsgDeadline.
 func (c *Conn) send(m *Message) error {
 	c.mu.RLock()
 	w := c.w
@@ -96,7 +99,7 @@ func (c *Conn) send(m *Message) error {
 	if w == nil {
 		return fmt.Errorf("stream %d: not connected", c.idx+1)
 	}
-	return w.WriteMsg(m)
+	return w.WriteMsgDeadline(m, c.connTmo)
 }
 
 // readMsg reads one message on the stream's current socket and also returns
@@ -118,7 +121,8 @@ func (c *Conn) readMsg() (*Message, net.Conn, error) {
 // stream slot (essential with single-port multiplexing where every stream
 // shares one listening port).
 func writeStreamID(nc net.Conn, idx int) error {
-	return NewMsgWriter(nc).WriteMsg(&Message{Type: MsgStreamID, Seq: uint64(idx)})
+	mw := NewMsgWriter(nc)
+	return mw.WriteMsgDeadline(&Message{Type: MsgStreamID, Seq: uint64(idx)}, 10*time.Second)
 }
 
 // readStreamID reads the connector's stream index frame. It applies a short

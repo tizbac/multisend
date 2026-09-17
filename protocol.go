@@ -44,14 +44,30 @@ type Chunk struct {
 
 type MsgWriter struct {
 	w  io.Writer
+	nc net.Conn
 	mu sync.Mutex
 }
 
 func NewMsgWriter(w io.Writer) *MsgWriter {
-	return &MsgWriter{w: w}
+	var nc net.Conn
+	if c, ok := w.(net.Conn); ok {
+		nc = c
+	}
+	return &MsgWriter{w: w, nc: nc}
 }
 
 func (mw *MsgWriter) WriteMsg(m *Message) error {
+	return mw.write(m, 0)
+}
+
+// WriteMsgDeadline writes one message, arming a write deadline on the
+// underlying socket first so a peer that stops reading cannot wedge this
+// goroutine forever. A tmo <= 0 disables the deadline.
+func (mw *MsgWriter) WriteMsgDeadline(m *Message, tmo time.Duration) error {
+	return mw.write(m, tmo)
+}
+
+func (mw *MsgWriter) write(m *Message, tmo time.Duration) error {
 	datalen := uint32(len(m.Data))
 	buf := make([]byte, MsgHdrSize+len(m.Data))
 	buf[0] = m.Type
@@ -61,7 +77,16 @@ func (mw *MsgWriter) WriteMsg(m *Message) error {
 
 	mw.mu.Lock()
 	defer mw.mu.Unlock()
+	if tmo > 0 && mw.nc != nil {
+		if err := mw.nc.SetWriteDeadline(time.Now().Add(tmo)); err != nil {
+			return err
+		}
+	}
 	_, err := mw.w.Write(buf)
+	if err == nil && tmo > 0 && mw.nc != nil {
+		// Clear the deadline so it doesn't leak into later messages.
+		mw.nc.SetWriteDeadline(time.Time{})
+	}
 	return err
 }
 
